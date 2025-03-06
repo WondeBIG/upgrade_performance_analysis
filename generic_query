@@ -1,0 +1,110 @@
+WITH raw_data AS (
+    -- Extract flight data, join with base data, and filter by production deployments
+    SELECT 
+        DATE_TRUNC('day', fbd.FILE_TIMESTAMP) AS date_day,
+        metadata['flight_id'] AS flight_id,
+        pf.hub_id,
+        
+        -- Identify hardware revision of the Power Distribution Board (PDB)
+        metadata['serial_numbers']['BATTERY_A']['PDB']['HW_REV']::INT AS HW_REV,
+        CASE 
+            WHEN HW_REV = 1 THEN 'PDB 7 OR EARLIER'
+            WHEN HW_REV = 2 THEN 'PDB 8'
+            WHEN HW_REV = 3 THEN 'PDB 9'
+            WHEN HW_REV = 4 THEN 'PDB 11'
+            WHEN HW_REV = 5 THEN 'PDB 8.1'
+            ELSE 'UNKNOWN_PDB_VERSION'
+        END AS PDB_VERSION,
+
+        -- Identify motor type
+        CASE 
+            WHEN CONTAINS(metadata['serial_numbers']['ROBIN_TAIL_OUTBOARD'], 'GRAUPNER_TAIL_OUTBOARD') THEN 'Graupner'
+            WHEN CONTAINS(metadata['serial_numbers'], 'MOTOR_AFT') THEN 'Loki'
+            ELSE 'Unknown'
+        END AS MOTOR_TYPE,
+
+        -- Extract Keystone CPU serial number
+        metadata['serial_numbers']['ROBIN_FLIGHT_PRIMARY']['CPU']['SERIAL_NUM'] AS Keystone_CPU,
+
+        -- Identify modem type
+        CASE 
+            WHEN CONTAINS(metadata['raw_files']['raw'], 'BATTERYB__CELLULAR2_MODEM_STATE.INDEX.gz') THEN 'Dual_Cell'
+            ELSE 'Single_Cell'
+        END AS Cell_Modem,
+
+        -- Extract preflight, mission, and flight failure exceptions
+        COALESCE(NULLIF(EXCEPTIONS_PREFLIGHT_TERMINAL, '[]'), NULL) AS PF_exception,
+        COALESCE(NULLIF(FAILURE_EXCEPTIONS_MISSION_FAILURE_REASON, '[]'), NULL) AS MF_Exception,
+        COALESCE(NULLIF(FAILURE_EXCEPTIONS_FLIGHT_FAILURE_REASON, '[]'), NULL) AS FF_Exception,
+
+        -- Identify whether the flight was real
+        IFF(WAS_REAL_FLIGHT = 'true', 1, 0) AS is_flight,
+
+        -- Determine failure classification
+        CASE 
+            WHEN DID_LAUNCH = FALSE AND PF_exception IS NOT NULL THEN 'Preflight Failure'
+            ELSE NULLIF(TRIM(HIGHEST_FAILURE_LEVEL, '[]""'), '')
+        END AS HIGHEST_FAILURE_LEVEL
+    FROM 
+        LOG_DB.PUBLIC.FLIGHTS pf
+    LEFT JOIN 
+        analytics.flight_base_data fbd 
+        ON metadata['flight_id'] = fbd.flight_id 
+        AND pf.hub_id = fbd.hub_id
+    INNER JOIN 
+        (SELECT * FROM analytics.dim_hubs WHERE is_production_hub = TRUE) dh 
+        ON dh.hub_id = pf.hub_id
+    WHERE 
+        HW_REV IS NOT NULL 
+        AND DID_LAUNCH IS NOT NULL 
+        AND Keystone_CPU IS NOT NULL 
+        AND date_day >= '{{Date_Deployed_To_Production}}'
+),
+hardware_performance AS (
+    -- Aggregate failure counts by hardware revision and failure type
+    SELECT 
+        PDB_VERSION,
+        MOTOR_TYPE,
+        Cell_Modem,
+        HIGHEST_FAILURE_LEVEL,
+        COUNT(DISTINCT flight_id) AS total_flights,
+        COUNT(DISTINCT CASE 
+            WHEN HIGHEST_FAILURE_LEVEL = 'Flight Failure' THEN flight_id 
+        END) AS flight_failures,
+        COUNT(DISTINCT CASE 
+            WHEN HIGHEST_FAILURE_LEVEL = 'Preflight Failure' THEN flight_id 
+        END) AS preflight_failures,
+        COUNT(DISTINCT CASE 
+            WHEN HIGHEST_FAILURE_LEVEL = 'Mission Failure' THEN flight_id 
+        END) AS mission_failures
+    FROM 
+        raw_data
+    GROUP BY 
+        PDB_VERSION, MOTOR_TYPE, Cell_Modem, HIGHEST_FAILURE_LEVEL
+),
+performance_trends AS (
+    -- Track performance improvements over time by comparing failure rates before and after upgrades
+    SELECT 
+        PDB_VERSION,
+        MOTOR_TYPE,
+        Cell_Modem,
+        SUM(total_flights) AS total_flights,
+        SUM(flight_failures) AS total_flight_failures,
+        SUM(preflight_failures) AS total_preflight_failures,
+        SUM(mission_failures) AS total_mission_failures,
+        
+        -- Calculate failure rates 
+        ROUND((SUM(flight_failures) / NULLIF(SUM(total_flights), 0), 2) AS flight_failure_rate,
+        ROUND((SUM(preflight_failures) / NULLIF(SUM(total_flights), 0), 2) AS preflight_failure_rate,
+        ROUND((SUM(mission_failures) / NULLIF(SUM(total_flights), 0), 2) AS mission_failure_rate
+    FROM 
+        hardware_performance
+    GROUP BY 
+        PDB_VERSION, MOTOR_TYPE, Cell_Modem
+)
+SELECT 
+    * 
+FROM 
+    performance_trends
+ORDER BY 
+    flight_failure_rate DESC
