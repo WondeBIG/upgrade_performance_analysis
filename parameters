@@ -1,0 +1,31 @@
+SELECT 
+    *, 
+    '{{Hardware}}' AS hardware_sel,  -- Selected hardware component
+    '{{Date_Deployed_To_Production}}' AS date_sel  -- Selected deployment date
+FROM 
+    exceptions.list
+
+    {% form %}
+
+Hardware:
+    type: select
+    description: 'Select Hardware Type'
+    default: Battery
+    options:
+      labels: LRU
+      values: LRU
+
+Exception:
+    type: multiselect
+    description: 'Select Relevant Exceptions From The List'
+    default: [ITC_FREQ_MONITOR_PARALAND_NODE_DEAD]
+    options:
+      labels: EXCEPTION
+      values: EXCEPTION
+
+Date_Deployed_To_Production:
+    type: date
+    default: '2022-01-01'
+    description: 'Enter Deployment Date of Upgrade or Preferred Analysis Date'
+
+{% endform %}
